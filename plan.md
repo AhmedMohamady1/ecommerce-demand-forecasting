@@ -1,0 +1,626 @@
+# E-Commerce Demand Forecasting — Project Plan
+### Distributed Data Analysis | University Project
+
+---
+
+## Table of Contents
+
+1. [Project Overview](#1-project-overview)
+2. [Dataset Description](#2-dataset-description)
+3. [Repository Structure](#3-repository-structure)
+4. [Infrastructure & Environment](#4-infrastructure--environment)
+5. [Role 1 — Data Engineer: Ingestion & Storage](#5-role-1--data-engineer-ingestion--storage)
+6. [Role 2 — Data Analyst: Exploration & Insights](#6-role-2--data-analyst-exploration--insights)
+7. [Role 3 — ML Engineer: Feature Engineering & Modeling](#7-role-3--ml-engineer-feature-engineering--modeling)
+8. [Role 4 — Big Data Engineer: Optimization & Performance](#8-role-4--big-data-engineer-optimization--performance)
+9. [Role 5 — MLOps Engineer: Deployment & Monitoring](#9-role-5--mlops-engineer-deployment--monitoring)
+10. [Deliverables Checklist](#10-deliverables-checklist)
+11. [Decisions Log](#11-decisions-log)
+
+---
+
+## 1. Project Overview
+
+| Field | Detail |
+|---|---|
+| **Goal** | Predict weekly per-store, per-item demand using PySpark |
+| **Data** | Historical daily sales (10 stores × 50 items × ~5 years) |
+| **Granularity** | Weekly aggregation (target = `weekly_sales`) |
+| **Storage** | MinIO object store acting as a distributed Data Lake |
+| **Processing** | Apache Spark in local mode (single machine, all cores) |
+| **Models** | Linear Regression, Random Forest, Gradient Boosting, ARIMA, Prophet |
+| **Language** | Python 3.13 |
+| **Submission** | GitHub repository link |
+
+### Objectives
+
+- Predict future product demand at the store/item/week level
+- Identify seasonal trends and purchasing patterns
+- Produce optimized, partitioned Spark datasets suitable for downstream analytics
+- Demonstrate distributed processing best practices (partitioning, replication, Spark tuning)
+
+### Team Assignments
+
+| Person | Roles Covered | Key Responsibilities |
+|---|---|---|
+| **Person 1** | Data Engineer + Data Analyst + Feature Engineering | Ingestion, cleaning, weekly aggregation, EDA notebook, lag/rolling/OHE features |
+| **Person 2** | ML Engineer (modeling & evaluation) | Train Linear Regression, Random Forest, GBT, ARIMA, Prophet; evaluate all models |
+| **Person 3** | Big Data Engineer | Spark tuning, partitioning strategy, repartition/coalesce, caching, MinIO layout |
+| **Person 4** | MLOps Engineer | End-to-end pipeline script, automation, monitoring module, final documentation |
+| **Person 5** | Support / Cross-role | Assists wherever needed; reviews PRs and integration testing |
+
+---
+
+## 2. Dataset Description
+
+### Raw Data (`data/raw_data.csv`)
+
+| Column | Type | Description |
+|---|---|---|
+| `date` | `DateType` | Daily date, starting 2013-01-01 |
+| `store` | `IntegerType` | Store ID (1 – 10) |
+| `item` | `IntegerType` | Item ID (1 – 50) |
+| `sales` | `IntegerType` | Units sold that day |
+
+- **Size**: ~913,000 rows (17 MB)
+- **Period**: 2013-01-01 → 2017-12-31 (5 years)
+- **Cardinality**: 10 stores × 50 items = 500 unique store/item pairs
+- **No nulls expected**, but nulls/outlier checks will be performed in the pipeline
+
+### Processed (Weekly) Schema
+
+After the Data Engineering pipeline, the schema becomes:
+
+| Column | Type | Notes |
+|---|---|---|
+| `store_id` | One-Hot Encoded (10 cols) | `store_1` … `store_10` |
+| `item_id` | One-Hot Encoded (50 cols) | `item_1` … `item_50` |
+| `week_of_year` | `IntegerType` (1–52) | ISO week number |
+| `month` | `IntegerType` (1–12) | Calendar month |
+| `lag_1_week` | `DoubleType` | Weekly sales, 1 week prior |
+| `lag_4_week` | `DoubleType` | Weekly sales, 4 weeks prior |
+| `lag_52_week` | `DoubleType` | Weekly sales, same week last year |
+| `rolling_4_week_avg` | `DoubleType` | Mean of last 4 weeks |
+| `rolling_12_week_avg` | `DoubleType` | Mean of last 12 weeks |
+| `weekly_sales` | `DoubleType` | **Target variable** — sum of 7 daily sales |
+
+> **Note on dropped features:** `day_of_week`, `is_weekend`, and `is_holiday` are intentionally excluded. Holiday effects (e.g., week 47 spike) are captured implicitly by `week_of_year`.
+
+**Total feature columns: 65** (10 store OHE + 50 item OHE + 2 temporal + 3 lag + 2 rolling)
+
+---
+
+## 3. Repository Structure
+
+```
+ecommerce-demand-forecasting/
+│
+├── plan.md                         ← This file
+├── README.md                       ← Project overview and setup instructions
+├── requirements.txt                ← Python dependencies (PySpark, Prophet, etc.)
+├── .env                            ← MinIO credentials and Spark config (gitignored)
+├── .gitignore
+│
+├── scripts/
+│   └── start_minio.sh              ← Downloads (if needed) and launches MinIO natively
+│
+├── data/
+│   ├── raw_data.csv                ← Source dataset (daily, 913k rows)
+│   └── sample/                     ← Small subset for local testing (optional)
+│
+├── config/
+│   └── spark_config.py             ← Centralized SparkSession factory with MinIO S3A settings
+│
+├── notebooks/
+│   ├── 01_eda.ipynb                ← Exploratory Data Analysis (Role 2)
+│   └── 02_model_evaluation.ipynb   ← Side-by-side model comparison and visualizations
+│
+├── src/
+│   ├── __init__.py
+│   │
+│   ├── ingestion/                  ← Role 1: Data Engineer
+│   │   ├── __init__.py
+│   │   ├── ingest.py               ← Reads raw CSV into Spark, validates schema
+│   │   └── upload_to_minio.py      ← Writes raw layer to MinIO (Bronze zone)
+│   │
+│   ├── preprocessing/              ← Role 1: Data Engineer
+│   │   ├── __init__.py
+│   │   ├── cleaner.py              ← Null handling, type casting, deduplication
+│   │   └── aggregator.py           ← Daily → Weekly aggregation (sum sales per store/item/week)
+│   │
+│   ├── feature_engineering/        ← Role 3: ML Engineer
+│   │   ├── __init__.py
+│   │   ├── temporal_features.py    ← week_of_year, month extraction
+│   │   ├── lag_features.py         ← lag_1, lag_4, lag_52 (using Spark Window functions)
+│   │   ├── rolling_features.py     ← rolling_4_avg, rolling_12_avg
+│   │   └── encoder.py              ← One-Hot Encoding for store_id and item_id
+│   │
+│   ├── eda/                        ← Role 2: Data Analyst
+│   │   ├── __init__.py
+│   │   └── analysis.py             ← Reusable Spark aggregation queries for EDA
+│   │
+│   ├── models/                     ← Role 3: ML Engineer
+│   │   ├── __init__.py
+│   │   ├── base_model.py           ← Abstract base class / shared train-eval interface
+│   │   ├── linear_regression.py    ← Spark MLlib Linear Regression
+│   │   ├── random_forest.py        ← Spark MLlib Random Forest Regressor
+│   │   ├── gradient_boosting.py    ← Spark MLlib GBT Regressor
+│   │   ├── arima_model.py          ← ARIMA via statsmodels (per store/item group)
+│   │   └── prophet_model.py        ← Facebook Prophet (per store/item group)
+│   │
+│   ├── evaluation/                 ← Role 3: ML Engineer
+│   │   ├── __init__.py
+│   │   └── metrics.py              ← RMSE, MAE, MAPE, R² computation helpers
+│   │
+│   ├── optimization/               ← Role 4: Big Data Engineer
+│   │   ├── __init__.py
+│   │   ├── partitioning.py         ← Repartition / coalesce strategies
+│   │   └── spark_tuning.py         ← Executor memory, shuffle configs, broadcast joins
+│   │
+│   └── pipeline/                   ← Role 5: MLOps Engineer
+│       ├── __init__.py
+│       ├── full_pipeline.py        ← End-to-end orchestration script
+│       └── monitor.py              ← Drift detection and performance tracking helpers
+│
+├── results/
+│   ├── metrics/                    ← Saved model evaluation CSVs
+│   └── plots/                      ← Saved visualizations (PNG/HTML)
+│
+└── docs/
+    ├── architecture_diagram.png    ← System architecture visual
+    └── final_report.md             ← Full project documentation
+```
+
+### MinIO Data Lake Zones (Bucket: `ecommerce-lake`)
+
+```
+ecommerce-lake/
+├── bronze/                         ← Raw ingested data (unchanged)
+│   └── raw_sales/
+│       └── raw_data.parquet
+│
+├── silver/                         ← Cleaned + aggregated weekly data
+│   └── weekly_sales/
+│       └── weekly_sales.parquet    (partitioned by store_id)
+│
+└── gold/                           ← Feature-engineered, model-ready data
+    └── features/
+        └── features.parquet        (partitioned by store_id, week_of_year)
+```
+
+---
+
+## 4. Infrastructure & Environment
+
+### Overview
+
+No Docker is used. All services run as **native processes** on the host machine:
+
+| Component | Installation method | Runs as |
+|---|---|---|
+| **MinIO** | Binary download (single executable) | Background process via `scripts/start_minio.sh` |
+| **MinIO Client (`mc`)** | Binary download | CLI tool for bucket creation |
+| **Apache Spark** | Installed via `pyspark` Python package | Embedded in-process (`local[*]` mode) |
+| **Python deps** | `pip install -r requirements.txt` inside `.venv` | In-process |
+
+### MinIO — Native Installation
+
+MinIO is a single static binary; no package manager or Docker needed.
+
+#### Install
+
+```bash
+# macOS (Apple Silicon)
+curl -O https://dl.min.io/server/minio/release/darwin-arm64/minio
+chmod +x minio
+sudo mv minio /usr/local/bin/
+
+# macOS (Intel)
+curl -O https://dl.min.io/server/minio/release/darwin-amd64/minio
+chmod +x minio
+sudo mv minio /usr/local/bin/
+
+# Linux (x86_64)
+curl -O https://dl.min.io/server/minio/release/linux-amd64/minio
+chmod +x minio
+sudo mv minio /usr/local/bin/
+```
+
+#### Install MinIO Client (`mc`)
+
+```bash
+# macOS (Apple Silicon)
+curl -O https://dl.min.io/client/mc/release/darwin-arm64/mc
+chmod +x mc && sudo mv mc /usr/local/bin/
+
+# Linux (x86_64)
+curl -O https://dl.min.io/client/mc/release/linux-amd64/mc
+chmod +x mc && sudo mv mc /usr/local/bin/
+```
+
+#### Start MinIO (`scripts/start_minio.sh`)
+
+The helper script reads credentials from `.env`, creates the data directory, starts the server, and creates the `ecommerce-lake` bucket:
+
+```bash
+#!/usr/bin/env bash
+set -e
+source .env
+
+export MINIO_ROOT_USER=$MINIO_ACCESS_KEY
+export MINIO_ROOT_PASSWORD=$MINIO_SECRET_KEY
+
+mkdir -p ~/minio-data
+minio server ~/minio-data --address ':9000' --console-address ':9001' &
+
+echo "Waiting for MinIO to start..."
+sleep 3
+
+mc alias set local http://localhost:9000 $MINIO_ACCESS_KEY $MINIO_SECRET_KEY
+mc mb --ignore-existing local/ecommerce-lake
+echo "MinIO running at http://localhost:9000  (console: http://localhost:9001)"
+```
+
+Run once before executing any pipeline step:
+
+```bash
+bash scripts/start_minio.sh
+```
+
+#### Environment File (`.env`)
+
+```
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin123
+```
+
+> **Replication note**: In this native single-process MinIO setup, all objects are stored on the local filesystem. For a fault-tolerant setup analogous to HDFS replication factor 3, MinIO would be deployed across multiple nodes/drives in erasure-coding mode. This is documented in `docs/final_report.md` as an architectural note.
+
+> **Why local mode?** The dataset (~130k weekly rows after aggregation) comfortably fits a single-machine Spark session. Local mode eliminates cluster overhead while still exercising all Spark APIs, partitioning, and Window functions identically to a distributed cluster.
+
+### Python Environment Setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### SparkSession Configuration (Local Mode + MinIO / S3A)
+
+```python
+spark = SparkSession.builder \
+    .master("local[*]") \
+    .appName("EcommerceDemandForecasting") \
+    .config("spark.hadoop.fs.s3a.endpoint", "http://localhost:9000") \
+    .config("spark.hadoop.fs.s3a.access.key", os.getenv("MINIO_ACCESS_KEY")) \
+    .config("spark.hadoop.fs.s3a.secret.key", os.getenv("MINIO_SECRET_KEY")) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+    .getOrCreate()
+```
+
+### Python Dependencies (`requirements.txt`)
+
+```
+pyspark>=3.4
+pandas
+numpy
+matplotlib
+seaborn
+plotly
+prophet
+statsmodels
+scikit-learn
+boto3
+python-dotenv
+pyarrow
+joblib
+```
+
+---
+
+## 5. Role 1 — Data Engineer: Ingestion & Storage
+
+### 5.1 Goal
+Transform `data/raw_data.csv` (daily, 913k rows) into a clean, aggregated weekly Parquet dataset stored in MinIO.
+
+### 5.2 Step-by-Step Tasks
+
+#### Step A — Ingestion (`src/ingestion/ingest.py`)
+1. Initialize SparkSession from `config/spark_config.py`
+2. Read `data/raw_data.csv` with an explicit schema:
+   ```
+   date: DateType, store: IntegerType, item: IntegerType, sales: IntegerType
+   ```
+3. Validate:
+   - Row count matches expected ~913,000
+   - No nulls in any column
+   - `sales` >= 0
+   - `store` in [1, 10], `item` in [1, 50]
+   - Date range: 2013-01-01 to 2017-12-31
+4. Print a validation summary to stdout
+
+#### Step B — Upload Raw Layer (`src/ingestion/upload_to_minio.py`)
+1. Write raw Spark DataFrame as Parquet to `s3a://ecommerce-lake/bronze/raw_sales/`
+2. Use `mode("overwrite")` to make the step idempotent
+
+#### Step C — Cleaning (`src/preprocessing/cleaner.py`)
+1. Cast `date` column to `DateType` if not already
+2. Drop duplicate rows
+3. Filter out rows with `sales < 0`
+4. Log count of removed rows
+
+#### Step D — Weekly Aggregation (`src/preprocessing/aggregator.py`)
+1. Extract `year` and `week_of_year` from `date` using `weekofyear()` and `year()`
+2. Group by `(store, item, year, week_of_year)` and sum `sales` → `weekly_sales`
+3. Result: ~500 store/item pairs × ~260 weeks ≈ **130,000 rows**
+4. Write Silver layer to `s3a://ecommerce-lake/silver/weekly_sales/`
+   - Partitioned by `store`
+
+### 5.3 Output Artifact
+`s3a://ecommerce-lake/silver/weekly_sales/` — clean weekly Parquet, partitioned by `store`
+
+---
+
+## 6. Role 2 — Data Analyst: Exploration & Insights
+
+### 6.1 Goal
+Explore the Silver dataset to understand sales distributions, seasonality, store/item trends, and validate preprocessing decisions before modeling.
+
+### 6.2 Notebook: `notebooks/01_eda.ipynb`
+
+All heavy computation uses PySpark; results are `.toPandas()` before plotting.
+
+#### Section 1 — Basic Statistics
+- Schema printout and row count
+- `df.describe()` on `weekly_sales`
+- Distribution of weekly sales (histogram)
+- Null check confirmation
+
+#### Section 2 — Temporal Trends
+- **Total weekly sales over time** (line chart): aggregate all stores/items by week
+- **Monthly seasonality**: box plot of `weekly_sales` grouped by `month`
+- **Week-of-year heatmap**: avg weekly sales by `week_of_year` across all years
+
+#### Section 3 — Store-Level Analysis
+- Bar chart: Total sales per store
+- Line chart: Average weekly sales per store across time
+
+#### Section 4 — Item-Level Analysis
+- Top 10 and bottom 10 items by total sales
+- Sales variance per item (volatility analysis)
+
+#### Section 5 — Correlation & Lag Validation
+- Scatter plot: `lag_1_week` vs `weekly_sales`
+- Pearson correlation matrix of all lag/rolling features with `weekly_sales`
+
+#### Section 6 — Key Insights (written summary)
+- Strong yearly seasonality (summer peaks, Q4 holiday patterns)
+- High variance between items (some items sell 5× more than others)
+- Store-level baselines differ but trend shapes are consistent
+- `week_of_year` is a strong predictor, validating the holiday encoding decision
+
+### 6.3 Output Artifacts
+- Saved plots in `results/plots/`
+- Written insights in `docs/final_report.md`
+
+---
+
+## 7. Role 3 — ML Engineer: Feature Engineering & Modeling
+
+### 7.1 Feature Engineering
+
+Operates on the Silver layer and outputs to the Gold layer.
+
+#### Step A — Temporal Features (`src/feature_engineering/temporal_features.py`)
+- `week_of_year = weekofyear(date_col)` — IntegerType, range 1-52
+- `month = month(date_col)` — IntegerType, range 1-12
+
+#### Step B — Lag Features (`src/feature_engineering/lag_features.py`)
+
+Use `pyspark.sql.Window` partitioned by `(store, item)`, ordered by `(year, week_of_year)`:
+
+| Feature | Window Offset | Description |
+|---|---|---|
+| `lag_1_week` | -1 week | Previous week's sales |
+| `lag_4_week` | -4 weeks | ~1 month ago |
+| `lag_52_week` | -52 weeks | Same week, prior year |
+
+> Rows with nulls in any lag feature (the first 52 weeks per store/item) are **dropped** before modeling.
+
+#### Step C — Rolling Features (`src/feature_engineering/rolling_features.py`)
+
+Use `Window.rowsBetween(-N, -1)` with `avg()`:
+
+| Feature | Window | Description |
+|---|---|---|
+| `rolling_4_week_avg` | Last 4 rows | Short-term trend |
+| `rolling_12_week_avg` | Last 12 rows | Quarterly trend |
+
+#### Step D — One-Hot Encoding (`src/feature_engineering/encoder.py`)
+
+Use Spark MLlib `StringIndexer` → `OneHotEncoder` pipeline:
+- `store` (10 values) → 10 binary columns: `store_1` … `store_10`
+- `item` (50 values) → 50 binary columns: `item_1` … `item_50`
+
+Gold Layer written to `s3a://ecommerce-lake/gold/features/`, partitioned by `(store, week_of_year)`.
+
+### 7.2 Train/Test Split
+
+| Split | Period | Approximate Rows |
+|---|---|---|
+| Train | 2013-W01 → 2016-W52 | ~104,000 |
+| Test | 2017-W01 → 2017-W52 | ~26,000 |
+
+Split is **chronological** (not random) to prevent data leakage.
+
+### 7.3 Models
+
+#### Model A — Linear Regression (`src/models/linear_regression.py`)
+- **Library**: `pyspark.ml.regression.LinearRegression`
+- **Purpose**: Interpretable baseline; coefficients reveal feature importance
+- **Hyperparameters**: `maxIter=100`, `regParam=0.1`, `elasticNetParam=0.0`
+
+#### Model B — Random Forest (`src/models/random_forest.py`)
+- **Library**: `pyspark.ml.regression.RandomForestRegressor`
+- **Purpose**: Non-linear interactions + built-in feature importance ranking
+- **Hyperparameters**: `numTrees=100`, `maxDepth=10`, `featureSubsetStrategy="auto"`
+
+#### Model C — Gradient Boosting (`src/models/gradient_boosting.py`)
+- **Library**: `pyspark.ml.regression.GBTRegressor`
+- **Purpose**: Typically highest accuracy; captures complex patterns
+- **Hyperparameters**: `maxIter=50`, `maxDepth=5`, `stepSize=0.1`
+
+#### Model D — ARIMA (`src/models/arima_model.py`)
+- **Library**: `statsmodels.tsa.arima.model.ARIMA`
+- **Purpose**: Classical time-series baseline; captures autocorrelation
+- **Strategy**: Group by `(store, item)`, convert to pandas, fit ARIMA(1,1,1) per group — **run across all 500 store/item pairs**
+- **Parallelism**: Use `joblib.Parallel` or Python `multiprocessing` to fit pairs concurrently across CPU cores
+- **Output**: Collect per-pair forecasts back into a single Spark DataFrame for unified evaluation
+
+#### Model E — Prophet (`src/models/prophet_model.py`)
+- **Library**: `prophet`
+- **Purpose**: Handles seasonality + trend automatically; best for long-horizon forecasts
+- **Strategy**: Same group-wise approach as ARIMA; columns renamed to `ds` / `y` — **run across all 500 store/item pairs**
+- **Config**: `yearly_seasonality=True`, `weekly_seasonality=False`, `daily_seasonality=False`
+- **Parallelism**: Same `joblib.Parallel` approach as ARIMA to keep runtime manageable
+
+### 7.4 Model Persistence
+
+All trained models are saved to the **MinIO Gold zone** after training:
+
+| Model | Persistence Method | MinIO Path |
+|---|---|---|
+| Linear Regression | Spark MLlib `.save()` | `s3a://ecommerce-lake/gold/models/linear_regression/` |
+| Random Forest | Spark MLlib `.save()` | `s3a://ecommerce-lake/gold/models/random_forest/` |
+| Gradient Boosting | Spark MLlib `.save()` | `s3a://ecommerce-lake/gold/models/gradient_boosting/` |
+| ARIMA | Pickle (per-pair dict) | `s3a://ecommerce-lake/gold/models/arima/arima_models.pkl` |
+| Prophet | Pickle (per-pair dict) | `s3a://ecommerce-lake/gold/models/prophet/prophet_models.pkl` |
+
+### 7.5 Evaluation (`src/evaluation/metrics.py`)
+
+| Metric | Description |
+|---|---|
+| **RMSE** | Root Mean Squared Error — penalizes large errors |
+| **MAE** | Mean Absolute Error — average magnitude |
+| **MAPE** | Mean Absolute Percentage Error — scale-independent |
+| **R²** | Coefficient of Determination — goodness of fit |
+
+Results saved to `results/metrics/model_comparison.csv` and also uploaded to `s3a://ecommerce-lake/gold/metrics/`.
+
+---
+
+## 8. Role 4 — Big Data Engineer: Optimization & Performance
+
+### 8.1 Partitioning Strategy
+
+| Stage | Partition Key(s) | Rationale |
+|---|---|---|
+| Bronze (raw) | None | Single large file; no predicate pushdown needed |
+| Silver (weekly) | `store` | 10 balanced partitions; enables per-store parallel reads |
+| Gold (features) | `store`, `week_of_year` | Up to 520 partitions; enables parallel model training per store |
+
+### 8.2 Repartition vs Coalesce
+
+```python
+# Before groupBy — shuffle for even distribution
+df = df.repartition(10, "store", "item")
+
+# After aggregation — reduce partitions without full shuffle
+df = df.coalesce(10)
+```
+
+> Use `repartition()` when increasing partition count or requiring a full shuffle; use `coalesce()` only to reduce partition count cheaply.
+
+### 8.3 Spark Performance Tuning (`src/optimization/spark_tuning.py`)
+
+Configs set on the `SparkSession` in local mode:
+
+| Config | Value | Reason |
+|---|---|---|
+| `spark.master` | `local[*]` | Uses all available CPU cores on the machine |
+| `spark.driver.memory` | `8g` | Driver acts as both master and executor in local mode |
+| `spark.sql.shuffle.partitions` | `20` | Avoids the wasteful default of 200 for this dataset size |
+| `spark.sql.autoBroadcastJoinThreshold` | `10mb` | Auto-broadcasts small dimension tables |
+| `spark.serializer` | `KryoSerializer` | Faster than Java default serializer |
+
+### 8.4 Window Function Optimization
+
+- Sort data before applying Window functions to avoid executor-side sorts
+- Cache the Silver DataFrame before feature engineering:
+  ```python
+  df_silver.cache()
+  df_silver.count()  # trigger materialization
+  ```
+
+### 8.5 Replication (MinIO)
+
+- MinIO configured with erasure coding for fault tolerance (equivalent to HDFS RF=3)
+- In a production HDFS setup: `dfs.replication=3`
+- For local Docker: single-node mode with volume mounts for data persistence
+- Object versioning retained for 30-day rollback
+
+---
+
+## 9. Role 5 — MLOps Engineer: Deployment & Monitoring
+
+### 9.1 End-to-End Pipeline (`src/pipeline/full_pipeline.py`)
+
+```
+[1] Ingest raw CSV
+    → [2] Upload to Bronze (MinIO)
+    → [3] Clean & Aggregate
+    → [4] Write Silver (MinIO)
+    → [5] Feature Engineering
+    → [6] Write Gold (MinIO)
+    → [7] Train all models
+    → [8] Evaluate & save metrics
+    → [9] Log summary
+```
+
+- Each step is wrapped in `try/except` with structured logging
+- Accepts `--stage` argument to resume from any step (e.g., `--stage feature_engineering`)
+
+### 9.2 Automation
+
+- **Manual**: `python src/pipeline/full_pipeline.py --stage all`
+- **Cron/Shell**: Scheduled weekly to retrain on new data
+- *(Stretch goal)* **Apache Airflow DAG**: `dags/demand_forecast_dag.py`
+
+### 9.3 Model Monitoring (`src/pipeline/monitor.py`)
+
+| Check | Method |
+|---|---|
+| **Performance drift** | Compare current RMSE vs baseline; alert if > 10% degradation |
+| **Data drift** | KS test on `weekly_sales` distribution of new vs training data |
+| **Missing data** | Alert if new input has > 1% null rate |
+
+Results appended to `results/metrics/monitoring_log.csv` with timestamps.
+
+### 9.4 Deliverables from MLOps Role
+- `src/pipeline/full_pipeline.py`
+- `results/metrics/model_comparison.csv`
+- `results/metrics/monitoring_log.csv`
+- Documentation section in `docs/final_report.md`
+
+---
+
+## 10. Deliverables Checklist
+
+| # | Deliverable | Owner Role | Location |
+|---|---|---|---|
+| 1 | Cleaned & preprocessed dataset (Silver) | Data Engineer | `s3a://ecommerce-lake/silver/` |
+| 2 | Feature-engineered dataset (Gold) | ML Engineer | `s3a://ecommerce-lake/gold/` |
+| 3 | EDA notebook with visualizations | Data Analyst | `notebooks/01_eda.ipynb` |
+| 4 | Trained forecasting models (5 total) | ML Engineer | `src/models/` |
+| 5 | Model comparison metrics | ML Engineer | `results/metrics/model_comparison.csv` |
+| 6 | Model evaluation notebook | ML Engineer | `notebooks/02_model_evaluation.ipynb` |
+| 7 | Optimized Spark pipeline | Big Data Engineer | `src/optimization/` |
+| 8 | End-to-end pipeline script | MLOps Engineer | `src/pipeline/full_pipeline.py` |
+| 9 | Monitoring module | MLOps Engineer | `src/pipeline/monitor.py` |
+| 10 | Full project documentation | All | `docs/final_report.md` |
+| 11 | MinIO startup script | Big Data Engineer | `scripts/start_minio.sh` |
+
+---
+
