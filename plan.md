@@ -180,18 +180,27 @@ ecommerce-demand-forecasting/
 
 ```
 ecommerce-lake/
-├── bronze/                         ← Raw ingested data (unchanged)
+├── bronze/                          ← Raw ingested data (unchanged, daily)
 │   └── raw_sales/
-│       └── raw_data.parquet
+│       └── *.parquet                (no partitioning)
 │
-├── silver/                         ← Cleaned + aggregated weekly data
-│   └── weekly_sales/
-│       └── weekly_sales.parquet    (partitioned by store_id)
+├── silver/                          ← Cleaned & enriched data (two sub-zones)
+│   ├── daily_sales/                 ← Daily rows + is_holiday per row
+│   │   └── store=1/ … store=10/    (partitioned by store, ~913k rows)
+│   └── weekly_sales/                ← Weekly aggregated rows
+│       └── store=1/ … store=10/    (partitioned by store, ~130k rows)
 │
-└── gold/                           ← Feature-engineered, model-ready data
+└── gold/                            ← Feature-engineered, model-ready data
     └── features/
-        └── features.parquet        (partitioned by store_id, week_of_year)
+        └── store=1/ … store=10/    (partitioned by store, written by Role 3)
 ```
+
+| Zone | Sub-zone | Granularity | Key columns | Written by |
+|---|---|---|---|---|
+| Bronze | `raw_sales/` | Daily (raw) | date, store, item, sales | Role 1 — Step B |
+| Silver | `daily_sales/` | Daily (enriched) | date, store, item, sales, **is_holiday** | Role 1 — Step C |
+| Silver | `weekly_sales/` | Weekly (aggregated) | store, item, year, week_of_year, **weekly_sales**, **week_has_holiday** | Role 1 — Step D |
+| Gold | `features/` | Weekly (feature-engineered) | + lag_1/4/52, rolling_4/12, store/item OHE | Role 3 — Feature Eng. |
 
 ---
 

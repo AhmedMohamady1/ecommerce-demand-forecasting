@@ -1,0 +1,14 @@
+setuptools
+pyspark==3.5.4
+pandas
+numpy
+matplotlib
+seaborn
+plotly
+prophet
+statsmodels
+scikit-learn
+boto3
+python-dotenv
+pyarrow
+joblib
