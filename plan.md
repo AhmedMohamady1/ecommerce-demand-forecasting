@@ -77,6 +77,7 @@ After the Data Engineering pipeline, the schema becomes:
 | `item_id` | One-Hot Encoded (50 cols) | `item_1` … `item_50` |
 | `week_of_year` | `IntegerType` (1–52) | ISO week number |
 | `month` | `IntegerType` (1–12) | Calendar month |
+| `week_has_holiday` | `IntegerType` (0 or 1) | 1 if any day in that week appears in the US holidays CSV |
 | `lag_1_week` | `DoubleType` | Weekly sales, 1 week prior |
 | `lag_4_week` | `DoubleType` | Weekly sales, 4 weeks prior |
 | `lag_52_week` | `DoubleType` | Weekly sales, same week last year |
@@ -84,9 +85,9 @@ After the Data Engineering pipeline, the schema becomes:
 | `rolling_12_week_avg` | `DoubleType` | Mean of last 12 weeks |
 | `weekly_sales` | `DoubleType` | **Target variable** — sum of 7 daily sales |
 
-> **Note on dropped features:** `day_of_week`, `is_weekend`, and `is_holiday` are intentionally excluded. Holiday effects (e.g., week 47 spike) are captured implicitly by `week_of_year`.
+> **Note:** `day_of_week` and `is_weekend` are dropped. `is_holiday` is NOT dropped — it is instead **aggregated to the week level** as `week_has_holiday` (1 if any day in the ISO week had a US public holiday). This allows the model to learn demand spikes on holiday weeks directly rather than relying solely on `week_of_year`.
 
-**Total feature columns: 65** (10 store OHE + 50 item OHE + 2 temporal + 3 lag + 2 rolling)
+**Total feature columns: 66** (10 store OHE + 50 item OHE + 2 temporal + 1 holiday + 3 lag + 2 rolling)
 
 ---
 
@@ -102,10 +103,13 @@ ecommerce-demand-forecasting/
 ├── .gitignore
 │
 ├── scripts/
-│   └── start_minio.sh              ← Downloads (if needed) and launches MinIO natively
+│   ├── start_minio.sh              ← Launches MinIO natively (macOS/Linux)
+│   ├── start_minio.bat             ← Launches MinIO natively (Windows)
+│   └── start_minio_docker.sh       ← Launches MinIO via Docker (cross-platform)
 │
 ├── data/
 │   ├── raw_data.csv                ← Source dataset (daily, 913k rows)
+│   ├── US Holiday Dates (2004-2021).csv  ← US public holidays used for week_has_holiday feature
 │   └── sample/                     ← Small subset for local testing (optional)
 │
 ├── config/
@@ -131,6 +135,7 @@ ecommerce-demand-forecasting/
 │   ├── feature_engineering/        ← Role 3: ML Engineer
 │   │   ├── __init__.py
 │   │   ├── temporal_features.py    ← week_of_year, month extraction
+│   │   ├── holiday_features.py     ← Joins US holidays CSV; creates week_has_holiday flag
 │   │   ├── lag_features.py         ← lag_1, lag_4, lag_52 (using Spark Window functions)
 │   │   ├── rolling_features.py     ← rolling_4_avg, rolling_12_avg
 │   │   └── encoder.py              ← One-Hot Encoding for store_id and item_id
@@ -194,43 +199,53 @@ ecommerce-lake/
 
 ### Overview
 
-No Docker is used. All services run as **native processes** on the host machine:
+The project supports **two setup paths** — team members can use whichever fits their machine. Both paths expose MinIO on the same `localhost:9000` endpoint, so **all Python/Spark code is identical regardless of which path is used.**
 
-| Component | Installation method | Runs as |
+| Component | Native path | Docker path |
 |---|---|---|
-| **MinIO** | Binary download (single executable) | Background process via `scripts/start_minio.sh` |
-| **MinIO Client (`mc`)** | Binary download | CLI tool for bucket creation |
-| **Apache Spark** | Installed via `pyspark` Python package | Embedded in-process (`local[*]` mode) |
-| **Python deps** | `pip install -r requirements.txt` inside `.venv` | In-process |
+| **MinIO** | Binary download, run via shell script | `docker run` one-liner |
+| **MinIO Client (`mc`)** | Binary download | Installed inside the same container / separate `mc` binary |
+| **Apache Spark** | `pyspark` Python package (embedded) | `pyspark` Python package (embedded) |
+| **Python deps** | `pip install -r requirements.txt` in `.venv` | Same |
 
-### MinIO — Native Installation
+> **Both paths target the same `.env` file** for credentials and the same MinIO endpoint (`http://localhost:9000`). No code changes are needed when switching paths.
 
-MinIO is a single static binary; no package manager or Docker needed.
+---
 
-#### Install
+### Path A — Native Installation (macOS / Linux / Windows)
+
+#### A1. Install MinIO Server Binary
 
 ```bash
-# macOS (Apple Silicon)
+# macOS — Apple Silicon (ARM64)
 curl -O https://dl.min.io/server/minio/release/darwin-arm64/minio
-chmod +x minio
-sudo mv minio /usr/local/bin/
+chmod +x minio && sudo mv minio /usr/local/bin/
 
-# macOS (Intel)
+# macOS — Intel (AMD64)
 curl -O https://dl.min.io/server/minio/release/darwin-amd64/minio
-chmod +x minio
-sudo mv minio /usr/local/bin/
+chmod +x minio && sudo mv minio /usr/local/bin/
 
 # Linux (x86_64)
 curl -O https://dl.min.io/server/minio/release/linux-amd64/minio
-chmod +x minio
-sudo mv minio /usr/local/bin/
+chmod +x minio && sudo mv minio /usr/local/bin/
 ```
 
-#### Install MinIO Client (`mc`)
+```powershell
+# Windows (PowerShell) — download to a folder on your PATH, e.g. C:\minio
+Invoke-WebRequest -Uri "https://dl.min.io/server/minio/release/windows-amd64/minio.exe" `
+    -OutFile "C:\minio\minio.exe"
+# Add C:\minio to your system PATH via System Properties → Environment Variables
+```
+
+#### A2. Install MinIO Client (`mc`)
 
 ```bash
-# macOS (Apple Silicon)
+# macOS — Apple Silicon
 curl -O https://dl.min.io/client/mc/release/darwin-arm64/mc
+chmod +x mc && sudo mv mc /usr/local/bin/
+
+# macOS — Intel
+curl -O https://dl.min.io/client/mc/release/darwin-amd64/mc
 chmod +x mc && sudo mv mc /usr/local/bin/
 
 # Linux (x86_64)
@@ -238,9 +253,13 @@ curl -O https://dl.min.io/client/mc/release/linux-amd64/mc
 chmod +x mc && sudo mv mc /usr/local/bin/
 ```
 
-#### Start MinIO (`scripts/start_minio.sh`)
+```powershell
+# Windows (PowerShell)
+Invoke-WebRequest -Uri "https://dl.min.io/client/mc/release/windows-amd64/mc.exe" `
+    -OutFile "C:\minio\mc.exe"
+```
 
-The helper script reads credentials from `.env`, creates the data directory, starts the server, and creates the `ecommerce-lake` bucket:
+#### A3. Start MinIO — macOS / Linux (`scripts/start_minio.sh`)
 
 ```bash
 #!/usr/bin/env bash
@@ -258,31 +277,109 @@ sleep 3
 
 mc alias set local http://localhost:9000 $MINIO_ACCESS_KEY $MINIO_SECRET_KEY
 mc mb --ignore-existing local/ecommerce-lake
-echo "MinIO running at http://localhost:9000  (console: http://localhost:9001)"
+echo "MinIO ready at http://localhost:9000  (console: http://localhost:9001)"
 ```
-
-Run once before executing any pipeline step:
 
 ```bash
 bash scripts/start_minio.sh
 ```
 
-#### Environment File (`.env`)
+#### A4. Start MinIO — Windows (`scripts/start_minio.bat`)
+
+```bat
+@echo off
+for /f "tokens=1,2 delims==" %%A in (.env) do set %%A=%%B
+
+set MINIO_ROOT_USER=%MINIO_ACCESS_KEY%
+set MINIO_ROOT_PASSWORD=%MINIO_SECRET_KEY%
+
+if not exist "%USERPROFILE%\minio-data" mkdir "%USERPROFILE%\minio-data"
+
+start "MinIO" minio.exe server %USERPROFILE%\minio-data --address :9000 --console-address :9001
+
+timeout /t 4 /nobreak > nul
+
+mc.exe alias set local http://localhost:9000 %MINIO_ACCESS_KEY% %MINIO_SECRET_KEY%
+mc.exe mb --ignore-existing local/ecommerce-lake
+echo MinIO ready at http://localhost:9000
+```
+
+```bat
+scripts\start_minio.bat
+```
+
+---
+
+### Path B — Docker (cross-platform)
+
+Requires **Docker Desktop** (or Docker Engine on Linux). No binary downloads needed.
+
+#### B1. Start MinIO (`scripts/start_minio_docker.sh`)
+
+```bash
+#!/usr/bin/env bash
+set -e
+source .env
+
+docker run -d \
+  --name minio \
+  -p 9000:9000 \
+  -p 9001:9001 \
+  -e MINIO_ROOT_USER=$MINIO_ACCESS_KEY \
+  -e MINIO_ROOT_PASSWORD=$MINIO_SECRET_KEY \
+  -v ~/minio-data:/data \
+  minio/minio server /data --console-address ':9001'
+
+echo "Waiting for MinIO to start..."
+sleep 4
+
+docker run --rm --network host \
+  -e MC_HOST_local="http://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}@localhost:9000" \
+  minio/mc mb --ignore-existing local/ecommerce-lake
+
+echo "MinIO ready at http://localhost:9000  (console: http://localhost:9001)"
+```
+
+```bash
+bash scripts/start_minio_docker.sh
+```
+
+> **On Windows with Docker Desktop**, run the same script inside Git Bash or WSL, or adapt the `docker run` command to a `.bat` / PowerShell script using `%MINIO_ACCESS_KEY%` variable syntax.
+
+#### B2. Stop / Remove MinIO container
+
+```bash
+docker stop minio && docker rm minio
+```
+
+---
+
+### Environment File (`.env`) — shared by both paths
 
 ```
 MINIO_ACCESS_KEY=minioadmin
 MINIO_SECRET_KEY=minioadmin123
 ```
 
-> **Replication note**: In this native single-process MinIO setup, all objects are stored on the local filesystem. For a fault-tolerant setup analogous to HDFS replication factor 3, MinIO would be deployed across multiple nodes/drives in erasure-coding mode. This is documented in `docs/final_report.md` as an architectural note.
+> **Replication note**: In this single-process MinIO setup, objects are stored on the local filesystem. A fault-tolerant production deployment would use MinIO in distributed/erasure-coding mode across multiple nodes (equivalent to HDFS `dfs.replication=3`). This is discussed in `docs/final_report.md`.
 
-> **Why local mode?** The dataset (~130k weekly rows after aggregation) comfortably fits a single-machine Spark session. Local mode eliminates cluster overhead while still exercising all Spark APIs, partitioning, and Window functions identically to a distributed cluster.
+> **Why Spark local mode?** The dataset (~130k weekly rows after aggregation) fits comfortably in-process. Local mode still exercises all Spark APIs, partitioning, and Window functions identically to a distributed cluster.
 
-### Python Environment Setup
+---
+
+### Python Environment Setup (all platforms)
 
 ```bash
+# macOS / Linux
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+```powershell
+# Windows (PowerShell)
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
@@ -345,21 +442,27 @@ Transform `data/raw_data.csv` (daily, 913k rows) into a clean, aggregated weekly
 1. Write raw Spark DataFrame as Parquet to `s3a://ecommerce-lake/bronze/raw_sales/`
 2. Use `mode("overwrite")` to make the step idempotent
 
-#### Step C — Cleaning (`src/preprocessing/cleaner.py`)
+#### Step C — Holiday Enrichment (`src/preprocessing/cleaner.py`)
 1. Cast `date` column to `DateType` if not already
 2. Drop duplicate rows
 3. Filter out rows with `sales < 0`
-4. Log count of removed rows
+4. Load `data/US Holiday Dates (2004-2021).csv` into a Spark DataFrame; keep only the `Date` column and add a literal `is_holiday = 1` flag
+5. Left-join the daily sales DataFrame on `date == holiday_date` → fill nulls in `is_holiday` with `0`
+6. Log count of removed/enriched rows
+
+> **Holiday CSV schema**: `Date, Holiday, WeekDay, Month, Day, Year` — 343 rows covering 2004–2021 across 18 holiday types (New Year's Day, Thanksgiving, Christmas, 4th of July, Memorial Day, Labor Day, Valentine's Day, MLK Day, etc.)
 
 #### Step D — Weekly Aggregation (`src/preprocessing/aggregator.py`)
 1. Extract `year` and `week_of_year` from `date` using `weekofyear()` and `year()`
-2. Group by `(store, item, year, week_of_year)` and sum `sales` → `weekly_sales`
+2. Group by `(store, item, year, week_of_year)` and compute:
+   - `weekly_sales = sum(sales)`
+   - `week_has_holiday = max(is_holiday)` → 1 if any day in that week had a holiday, else 0
 3. Result: ~500 store/item pairs × ~260 weeks ≈ **130,000 rows**
 4. Write Silver layer to `s3a://ecommerce-lake/silver/weekly_sales/`
    - Partitioned by `store`
 
 ### 5.3 Output Artifact
-`s3a://ecommerce-lake/silver/weekly_sales/` — clean weekly Parquet, partitioned by `store`
+`s3a://ecommerce-lake/silver/weekly_sales/` — clean weekly Parquet (with `week_has_holiday`), partitioned by `store`
 
 ---
 
@@ -417,7 +520,20 @@ Operates on the Silver layer and outputs to the Gold layer.
 - `week_of_year = weekofyear(date_col)` — IntegerType, range 1-52
 - `month = month(date_col)` — IntegerType, range 1-12
 
-#### Step B — Lag Features (`src/feature_engineering/lag_features.py`)
+#### Step B — Holiday Feature (`src/feature_engineering/holiday_features.py`)
+
+`week_has_holiday` is produced during **aggregation** (Step D of Role 1), not here. This module provides a validation helper that verifies the column exists in the Silver layer and logs the distribution:
+
+```
+week_has_holiday = 0 → majority of weeks
+week_has_holiday = 1 → weeks containing at least one US public holiday
+```
+
+Expected holiday weeks per year: ~15–20 (depending on which holidays fall in unique ISO weeks).
+
+> **Why `max(is_holiday)` over the week?** A week is flagged as a holiday week if *any* of its 7 days is a holiday. This correctly captures multi-day holiday events (e.g., Christmas Eve + Christmas Day both in week 52) without double-counting.
+
+#### Step C — Lag Features (`src/feature_engineering/lag_features.py`)
 
 Use `pyspark.sql.Window` partitioned by `(store, item)`, ordered by `(year, week_of_year)`:
 
@@ -429,7 +545,7 @@ Use `pyspark.sql.Window` partitioned by `(store, item)`, ordered by `(year, week
 
 > Rows with nulls in any lag feature (the first 52 weeks per store/item) are **dropped** before modeling.
 
-#### Step C — Rolling Features (`src/feature_engineering/rolling_features.py`)
+#### Step D — Rolling Features (`src/feature_engineering/rolling_features.py`)
 
 Use `Window.rowsBetween(-N, -1)` with `avg()`:
 
@@ -438,7 +554,7 @@ Use `Window.rowsBetween(-N, -1)` with `avg()`:
 | `rolling_4_week_avg` | Last 4 rows | Short-term trend |
 | `rolling_12_week_avg` | Last 12 rows | Quarterly trend |
 
-#### Step D — One-Hot Encoding (`src/feature_engineering/encoder.py`)
+#### Step E — One-Hot Encoding (`src/feature_engineering/encoder.py`)
 
 Use Spark MLlib `StringIndexer` → `OneHotEncoder` pipeline:
 - `store` (10 values) → 10 binary columns: `store_1` … `store_10`
