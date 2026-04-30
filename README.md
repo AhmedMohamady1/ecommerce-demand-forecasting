@@ -188,6 +188,9 @@ python -m src.feature_engineering.engineer
 > **Note**: Step E will work once `src/feature_engineering/engineer.py` is implemented (Role 3).  
 > Steps B–D are fully working now.
 
+# Step F — Run training and evaluation pipeline with:
+python src/models/train_evaluate.py
+
 ---
 
 ## Data Lake Layout
