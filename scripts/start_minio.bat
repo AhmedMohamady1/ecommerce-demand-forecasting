@@ -28,16 +28,16 @@ set MINIO_DATA_DIR=%USERPROFILE%\minio-data
 if not exist "%MINIO_DATA_DIR%" mkdir "%MINIO_DATA_DIR%"
 
 echo ^> Starting MinIO server (data dir: %MINIO_DATA_DIR%) ...
-start "MinIO Server" minio.exe server "%MINIO_DATA_DIR%" --address :9000 --console-address :9001
+start "MinIO Server" "C:\minio\minio.exe" server "%MINIO_DATA_DIR%" --address :9000 --console-address :9001
 
 echo   Waiting for MinIO to start...
 timeout /t 5 /nobreak > nul
 
 echo ^> Configuring mc alias 'local'...
-mc.exe alias set local http://localhost:9000 %MINIO_ACCESS_KEY% %MINIO_SECRET_KEY% --api S3v4
+"C:\minio\mc.exe" alias set local http://localhost:9000 %MINIO_ACCESS_KEY% %MINIO_SECRET_KEY% --api S3v4
 
 echo ^> Creating bucket 'ecommerce-lake' (if not exists)...
-mc.exe mb --ignore-existing local/ecommerce-lake
+"C:\minio\mc.exe" mb --ignore-existing local/ecommerce-lake
 
 echo.
 echo [OK] MinIO is ready!
