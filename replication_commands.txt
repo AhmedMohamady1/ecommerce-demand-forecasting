@@ -1,0 +1,13 @@
+mc ls --versions local/ecommerce-lake/gold/metrics/model_comparison.csv
+
+[2026-05-01 10:00:00 AST]  1.2KiB STANDARD b1c2... model_comparison.csv
+[2026-05-01 09:00:00 AST]  1.1KiB STANDARD a9x1... model_comparison.csv
+
+mc cp --vid a9x1... local/ecommerce-lake/gold/metrics/model_comparison.csv ./old_comparison.csv
+mc cp --vid a9x1... local/ecommerce-lake/gold/metrics/model_comparison.csv local/ecommerce-lake/gold/metrics/model_comparison.csv
+
+docker run --rm -e MC_HOST_local="http://minioadmin:minioadmin123@host.docker.internal:9000" minio/mc ls --versions local/ecommerce-lake/gold/metrics/model_comparison.csv
+
+docker run --rm -v "$(PWD):/data" -w /data -e MC_HOST_local="http://minioadmin:minioadmin123@host.docker.internal:9000" minio/mc cp --vid 5254e65f-a241-43ab-9e23-3ea89199f73f local/ecommerce-lake/gold/metrics/model_comparison.csv ./old_comparison.csv
+
+docker run --rm -e MC_HOST_local="http://minioadmin:minioadmin123@host.docker.internal:9000" minio/mc cp --vid 5254e65f-a241-43ab-9e23-3ea89199f73f local/ecommerce-lake/gold/metrics/model_comparison.csv local/ecommerce-lake/gold/metrics/model_comparison.csv
