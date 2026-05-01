@@ -67,9 +67,6 @@ def generate_predictions(df):
     predictions = []
 
     grouped = test_weeks.groupby(['store', 'item'])
-    progress_bar = st.progress(0)
-    total = len(grouped)
-    
     for idx, ((s, i), grp) in enumerate(grouped):
         model = models.get((s, i))
         if model is not None:
@@ -81,10 +78,6 @@ def generate_predictions(df):
             grp = grp.copy()
             grp['sales_prediction'] = forecast['yhat'].values
             predictions.append(grp)
-            
-        progress_bar.progress((idx + 1) / total)
-        
-    progress_bar.empty()
     return pd.concat(predictions, ignore_index=True)
 
 
@@ -267,28 +260,15 @@ elif st.session_state.page.startswith('Year'):
                     if proj_root not in sys.path:
                         sys.path.insert(0, proj_root)
                     
-                    from config.spark_config import get_spark
-                    from src.pipeline.monitor import check_performance_drift, check_missing_data, get_baseline_rmse
+                    from src.pipeline.monitor import check_performance_drift, check_missing_data, get_baseline_rmse, run_evaluation_merge
                     
-                    # 1. Get Actuals via PySpark from Silver Bucket
-                    spark = get_spark("StreamlitMonitor")
-                    silver_spark = spark.read.parquet("s3a://ecommerce-lake/silver/weekly_sales/")
-                    silver_df = silver_spark.select("year", "week_of_year", "store", "item", "weekly_sales").toPandas()
-                    silver_df = silver_df.rename(columns={"week_of_year": "week"})
+                    current_rmse, merged = run_evaluation_merge(filtered)
                     
-                    # 2. Merge Predictions with Actuals
-                    merged = pd.merge(filtered, silver_df, on=["year", "week", "store", "item"], how="inner")
-                    
-                    if merged.empty:
+                    if merged.empty or current_rmse is None:
                         st.warning("Could not find matching actual sales in the Gold bucket for these predictions. Cannot calculate RMSE.")
                     else:
-                        from sklearn.metrics import mean_squared_error
-                        import numpy as np
-                        
                         # 3. Run Checks
-                        current_rmse = np.sqrt(mean_squared_error(merged["weekly_sales"], merged["sales_prediction"]))
                         is_perf_drift = check_performance_drift("Prophet", current_rmse)
-                        
                         is_missing = check_missing_data(st.session_state.uploaded_df)
                         
                         # 4. Display Dashboard Metrics
