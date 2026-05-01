@@ -63,7 +63,18 @@ def _week_to_date(year: int, week: int) -> pd.Timestamp:
     Convert (year, ISO week_of_year) to a Monday date (ds column for Prophet).
     Uses ISO-consistent week start (Monday of that ISO week).
     """
-    return pd.Timestamp.fromisocalendar(year, int(week), 1)
+    try:
+        return pd.Timestamp.fromisocalendar(year, int(week), 1)
+    except ValueError:
+        # If the week is invalid for the given calendar year (e.g., week 53 but 
+        # the year only has 52 ISO weeks), it typically belongs to the previous ISO year.
+        if int(week) == 53:
+            try:
+                return pd.Timestamp.fromisocalendar(year - 1, 53, 1)
+            except ValueError:
+                pass
+        # Fallback: estimate the date as January 1st plus (week-1) weeks
+        return pd.Timestamp(f"{year}-01-01") + pd.Timedelta(weeks=int(week)-1)
 
 
 # ── Per-pair Prophet fit/forecast ─────────────────────────────────────────────
