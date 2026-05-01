@@ -1,8 +1,91 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import os
+import io
+import pickle
+import boto3
+import sys
+from dotenv import load_dotenv
+
+proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if proj_root not in sys.path:
+    sys.path.insert(0, proj_root)
+
+load_dotenv(os.path.join(proj_root, ".env"))
 
 st.set_page_config(page_title="Ecommerce Demand Forecasting App", layout="wide")
+
+
+@st.cache_resource
+def load_prophet_models():
+    minio_endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
+    access_key = os.getenv("MINIO_ACCESS_KEY")
+    secret_key = os.getenv("MINIO_SECRET_KEY")
+    
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=minio_endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+    )
+    
+    obj = s3_client.get_object(Bucket="ecommerce-lake", Key="gold/models/prophet/prophet_models.pkl")
+    return pickle.loads(obj['Body'].read())
+
+def generate_predictions(df):
+    from config.spark_config import get_spark
+    from src.preprocessing.cleaner import clean_and_enrich
+    from src.preprocessing.aggregator import aggregate_to_weekly
+    from src.models.prophet_model import _week_to_date
+
+    spark = get_spark("StreamlitMonitor")
+    
+    df = df.copy()
+    # Cast date to Python date objects for PySpark DateType compatibility
+    df['date'] = pd.to_datetime(df['date'], dayfirst=True).dt.date
+    
+    # If the user uploads a test set without sales, inject dummy sales 
+    # so cleaner.py (which expects 'sales' to filter >= 0) doesn't fail.
+    if 'sales' not in df.columns:
+        df['sales'] = 0
+        
+    spark_df = spark.createDataFrame(df)
+    
+    # --- REUSING IDENTICAL PIPELINE PREPROCESSING ---
+    clean_df = clean_and_enrich(spark_df, spark)
+    weekly_df = aggregate_to_weekly(clean_df)
+    
+    # Convert back to Pandas for Prophet inference
+    weekly_pdf = weekly_df.toPandas()
+    
+    test_weeks = weekly_pdf[['store', 'item', 'year', 'week_of_year']].drop_duplicates()
+    test_weeks = test_weeks.rename(columns={'week_of_year': 'week'})
+    
+    models = load_prophet_models()
+    
+    predictions = []
+
+    grouped = test_weeks.groupby(['store', 'item'])
+    progress_bar = st.progress(0)
+    total = len(grouped)
+    
+    for idx, ((s, i), grp) in enumerate(grouped):
+        model = models.get((s, i))
+        if model is not None:
+            test_prophet = pd.DataFrame({
+                "ds": [_week_to_date(r["year"], r["week"]) for _, r in grp.iterrows()],
+            })
+            forecast = model.predict(test_prophet)
+            
+            grp = grp.copy()
+            grp['sales_prediction'] = forecast['yhat'].values
+            predictions.append(grp)
+            
+        progress_bar.progress((idx + 1) / total)
+        
+    progress_bar.empty()
+    return pd.concat(predictions, ignore_index=True)
 
 
 def filter_predictions(df, year=None, stores=None, items=None, week_range=None):
@@ -26,11 +109,8 @@ if 'uploaded_df' not in st.session_state:
 if 'predictions_df' not in st.session_state:
     st.session_state.predictions_df = None
 
-
 def go_to(page_name: str):
     st.session_state.page = page_name
-    # Try the preferred API if available; otherwise continue and the UI
-    # will render the new page in the same run.
     rerun = getattr(st, 'experimental_rerun', None)
     if callable(rerun):
         try:
@@ -50,75 +130,14 @@ def predictions_page_name():
     return 'Year Predictions'
 
 
-
-# Safe query-param helpers (some Streamlit versions don't expose these experimental APIs)
-def get_query_params():
-    try:
-        return st.experimental_get_query_params()
-    except Exception:
-        return {}
-
-
-def set_query_params(**kwargs):
-    try:
-        st.experimental_set_query_params(**kwargs)
-    except Exception:
-        return
-
-
-# Handle query params (used by the wide green Make Predictions link when supported)
-params = get_query_params()
-if params and 'make_predictions' in params:
-    # require uploaded data to exist
-    if st.session_state.get('uploaded_file') is None and st.session_state.get('uploaded_df') is None:
-        st.warning('Please upload a CSV file before making predictions.')
-        set_query_params()
-    else:
-        # Actual model inference should populate `predictions_df` here.
-        # For now create an empty predictions dataframe with expected columns.
-        st.session_state.predictions_df = pd.DataFrame(
-            columns=["year", "week", "store", "item", "sales_prediction"]
-        )
-        go_to(predictions_page_name())
-
-
-# CSS for wide green Make Predictions link
-st.markdown(
-    """
-    <style>
-     a.make-preds{display:inline-block;text-align:center;background:#28a745;color:white;padding:14px 20px;border-radius:6px;text-decoration:none;font-weight:600;width:100%;}
-     a.make-preds:hover{opacity:0.9;}
-     /* tighten top spacing so header appears nearer the top */
-     div.block-container{padding-top:0.5rem;}
-     div.block-container h1{margin-top:0.25rem;}
-     /* prevent button text wrapping and ensure horizontal spacing */
-.stButton>button {
-    width: auto;             
-    min-width: 100px;   
-    white-space: nowrap;
-    padding: 6px 20px;  
-    font-weight: 600;
-    margin-left: 6px;
-    box-sizing: border-box;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}</style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
 # --- Top header + page-specific right-aligned buttons ---
 col1, col2, col3 = st.columns([7, 1, 2.5], vertical_alignment="bottom")
 title_ph = col1.empty()
 btn2_ph = col2.empty()
 btn3_ph = col3.empty()
 
-# current page
 page = st.session_state.get('page', 'Home')
 
-# Render buttons into placeholders based on current page and capture clicks
 home_top_clicked = False
 team_top_clicked = False
 viz_top_clicked = False
@@ -129,25 +148,20 @@ home_top_team_clicked = False
 if page == 'Home':
     team_top_clicked = btn3_ph.button('👥 Team', key='team_top')
 elif page.startswith('Year'):
-    # group the two action buttons into the right container so they stay together
     right_container = btn3_ph.container()
     b1, b2 = right_container.columns([1, 1])
     home_top_clicked = b1.button('🏠 Home', key='home_top')
     viz_top_clicked = b2.button('📊 Visualization', key='viz_top')
 elif page == 'Visualization':
-    # group Home and Back in the right container (Home left, Back right)
     right_container = btn3_ph.container()
     b1, b2 = right_container.columns([1, 1])
     home_top_viz_clicked = b1.button('🏠 Home', key='home_top_viz')
     back_top_clicked = b2.button('🔙 Back to Predictions', key='back_top')
 elif page == 'Team':
-    # right-align the Home button on the Team page
     home_top_team_clicked = btn3_ph.button('🏠 Home', key='home_top_team')
 
-# Persistent title
 title_ph.title('Ecommerce Demand Forecasting App')
 
-# Determine new page if any button was clicked
 new_page = None
 if team_top_clicked:
     new_page = 'Team'
@@ -159,14 +173,11 @@ elif back_top_clicked:
     new_page = predictions_page_name()
 
 if new_page is not None:
-    # update session state so the rest of the script renders the selected page
     st.session_state.page = new_page
     page = new_page
-    # clear placeholders and re-render them for the new page state so header updates immediately
     title_ph.empty()
     btn2_ph.empty()
     btn3_ph.empty()
-    # reuse the same placeholders to render the updated header/buttons
     title_ph.title('Ecommerce Demand Forecasting App')
     if page == 'Home':
         btn3_ph.button('👥 Team', key='team_top')
@@ -186,11 +197,13 @@ if new_page is not None:
 
 # --- Page bodies ---
 if st.session_state.page == 'Home':
-    st.write('Upload weekly sales data CSV')
+    st.markdown("### Welcome to the Retail Demand Forecasting Dashboard")
+    st.write('This dashboard uses our production **Prophet** model loaded directly from the MinIO Data Lake (`gold/models/prophet/prophet_models.pkl`).')
+    st.write('Please upload your daily sales data (CSV format: `date`, `store`, `item`...).')
 
     left, right = st.columns([3, 1])
     with left:
-        uploaded_file = st.file_uploader('Upload CSV file (columns: year,week,store,item,...)', type=['csv'], key='uploaded_file')
+        uploaded_file = st.file_uploader('Upload CSV file', type=['csv'], key='uploaded_file')
         if uploaded_file is not None:
             try:
                 st.session_state.uploaded_df = pd.read_csv(uploaded_file)
@@ -199,21 +212,13 @@ if st.session_state.page == 'Home':
         else:
             st.session_state.uploaded_df = None
 
-    # show preview and wide Make Predictions only when data is present
     if st.session_state.uploaded_df is not None and not st.session_state.uploaded_df.empty:
         st.subheader('Preview of uploaded data')
-        st.dataframe(st.session_state.uploaded_df.head(200), height=300)
-        st.markdown('<br/>', unsafe_allow_html=True)
-        # If the Streamlit build supports query params, render a wide anchor that sets them.
-        # Otherwise show a regular Streamlit button as a fallback.
-        if hasattr(st, 'experimental_get_query_params'):
-            st.markdown('<a href="?make_predictions=1" class="make-preds">🚀 Make Predictions</a>', unsafe_allow_html=True)
-        else:
-            if st.button('🚀 Make Predictions', key='make_preds_btn'):
-                # Trigger prediction flow — replace with model inference integration.
-                st.session_state.predictions_df = pd.DataFrame(
-                    columns=["year", "week", "store", "item", "sales_prediction"]
-                )
+        st.dataframe(st.session_state.uploaded_df.head(100), height=250)
+        
+        if st.button('🚀 Run Prophet Forecast on Uploaded Data', type='primary'):
+            with st.spinner("Loading Prophet models from MinIO and running inference..."):
+                st.session_state.predictions_df = generate_predictions(st.session_state.uploaded_df)
                 st.session_state.page = predictions_page_name()
                 st.rerun()
 
@@ -221,7 +226,7 @@ if st.session_state.page == 'Home':
 elif st.session_state.page.startswith('Year'):
     df = st.session_state.predictions_df
     if df is None or (hasattr(df, 'empty') and df.empty):
-        st.warning('No predictions available. Go to Home and upload data, then click Make Predictions.')
+        st.warning('No predictions available. Go to Home and click Make Predictions.')
         if st.button('Back to Home', key='back_no_preds'):
             go_to('Home')
     else:
@@ -245,10 +250,72 @@ elif st.session_state.page.startswith('Year'):
 
         filtered = filter_predictions(df, year=sel_year, stores=sel_stores, items=sel_items, week_range=sel_week_range)
 
-        st.subheader('Predictions table')
+        st.subheader('Weekly Sales Predictions (Prophet)')
         st.dataframe(filtered, height=600)
         csv = filtered.to_csv(index=False).encode('utf-8')
-        st.download_button('Download filtered predictions', data=csv, file_name=f'predictions.csv', mime='text/csv')
+        st.download_button('⬇️ Download filtered predictions', data=csv, file_name=f'prophet_predictions_2017.csv', mime='text/csv')
+
+        st.divider()
+        st.subheader("🔍 Production Monitoring Check")
+        st.write("Click below to run the MLOps monitoring suite. This downloads the actual ground-truth sales from the MinIO Gold bucket to calculate our real performance and test for statistical drift.")
+
+        if st.button("🚨 Run Monitor Check", type="secondary"):
+            with st.spinner("Initializing PySpark and connecting to MinIO Data Lake..."):
+                try:
+                    import sys
+                    proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                    if proj_root not in sys.path:
+                        sys.path.insert(0, proj_root)
+                    
+                    from config.spark_config import get_spark
+                    from src.pipeline.monitor import check_performance_drift, check_missing_data, get_baseline_rmse
+                    
+                    # 1. Get Actuals via PySpark from Silver Bucket
+                    spark = get_spark("StreamlitMonitor")
+                    silver_spark = spark.read.parquet("s3a://ecommerce-lake/silver/weekly_sales/")
+                    silver_df = silver_spark.select("year", "week_of_year", "store", "item", "weekly_sales").toPandas()
+                    silver_df = silver_df.rename(columns={"week_of_year": "week"})
+                    
+                    # 2. Merge Predictions with Actuals
+                    merged = pd.merge(filtered, silver_df, on=["year", "week", "store", "item"], how="inner")
+                    
+                    if merged.empty:
+                        st.warning("Could not find matching actual sales in the Gold bucket for these predictions. Cannot calculate RMSE.")
+                    else:
+                        from sklearn.metrics import mean_squared_error
+                        import numpy as np
+                        
+                        # 3. Run Checks
+                        current_rmse = np.sqrt(mean_squared_error(merged["weekly_sales"], merged["sales_prediction"]))
+                        is_perf_drift = check_performance_drift("Prophet", current_rmse)
+                        
+                        is_missing = check_missing_data(st.session_state.uploaded_df)
+                        
+                        # 4. Display Dashboard Metrics
+                        col1, col3 = st.columns(2)
+                        
+                        baseline_rmse = get_baseline_rmse("Prophet")
+                        if baseline_rmse is None:
+                            baseline_rmse = 30.41
+                        
+                        with col1:
+                            st.metric("Current RMSE", f"{current_rmse:.2f}", delta=f"{current_rmse - baseline_rmse:.2f} from baseline", delta_color="inverse")
+                            if is_perf_drift:
+                                st.error("**Performance Drift Detected!**\nThe model's error has degraded by >10% compared to its training baseline. It is time to retrain.")
+                            else:
+                                st.success("**Performance OK**\nThe model is operating within acceptable error bounds.")
+                                
+                        with col3:
+                            st.metric("Missing Data", "Failed" if is_missing else "Passed")
+                            if is_missing:
+                                st.error("**Missing Data Detected!**\nMore than 1% of the newly uploaded rows contain null values. Check the upstream pipeline.")
+                            else:
+                                st.success("**Data Quality OK**\nMissing values are within the acceptable <1% threshold.")
+                        
+                        st.info("💡 **Interpretation:** The **RMSE** tracks our Prophet model's exact accuracy. If it exceeds 10% degradation from the baseline stored in our training metrics, the model must be retrained. The **Missing Data** check ensures pipeline health before generating predictions.")
+                        
+                except Exception as e:
+                    st.error(f"Error running monitor: {str(e)}")
 
 
 elif st.session_state.page == 'Visualization':
@@ -273,38 +340,34 @@ elif st.session_state.page == 'Visualization':
         if filtered.empty:
             st.warning('No data after applying filters.')
         else:
-            # ensure week is numeric for proper ordering on x-axis
             if 'week' in filtered.columns:
                 try:
                     filtered['week'] = pd.to_numeric(filtered['week'], errors='coerce')
                 except Exception:
                     pass
 
-            # Weekly sales per store (one line per store)
             weekly_store = filtered.groupby(['week', 'store'], as_index=False)['sales_prediction'].sum()
             fig_store = px.line(
                 weekly_store,
                 x='week',
                 y='sales_prediction',
                 color='store',
-                title='Weekly Sales Prediction by Store',
+                title='Weekly Sales Prediction by Store (Prophet)',
                 markers=True,
                 color_discrete_sequence=px.colors.qualitative.Plotly,
             )
 
-            # Weekly sales per item (one line per item)
             weekly_item = filtered.groupby(['week', 'item'], as_index=False)['sales_prediction'].sum()
             fig_item = px.line(
                 weekly_item,
                 x='week',
                 y='sales_prediction',
                 color='item',
-                title='Weekly Sales Prediction by Item',
+                title='Weekly Sales Prediction by Item (Prophet)',
                 markers=True,
                 color_discrete_sequence=px.colors.qualitative.Plotly,
             )
 
-            # Bar charts (keep existing but add colorful palettes)
             item_totals = filtered.groupby('item', as_index=False)['sales_prediction'].sum().sort_values('sales_prediction', ascending=False)
             fig_item_bar = px.bar(
                 item_totals,
@@ -325,7 +388,6 @@ elif st.session_state.page == 'Visualization':
                 color_discrete_sequence=px.colors.sequential.Viridis,
             )
 
-            # Layout: two line plots on top, two bar charts below
             l1, l2 = st.columns(2)
             l1.plotly_chart(fig_store, width='stretch')
             l2.plotly_chart(fig_item, width='stretch')
@@ -336,7 +398,6 @@ elif st.session_state.page == 'Visualization':
 
 
 elif st.session_state.page == 'Team':
-    # --- EDIT THE `team_data` LIST BELOW TO FILL YOUR TEAM DETAILS IN THE CODE ---
     team_data = [
         {'Role': 'Data Engineer (Ingestion & Storage)\n\nData Analyst (Exploration & Insights)', 'ID': '22010038','Name': 'احمد محمد محمود محمود محمدى'},
         {'Role': 'Machine Learning Engineer (Model Development)', 'ID': '22010056', 'Name': 'الحسين ياسر ابراهيم السيد'},

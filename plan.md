@@ -113,7 +113,7 @@ ecommerce-demand-forecasting/
 │   └── sample/                     ← Small subset for local testing (optional)
 │
 ├── config/
-│   └── spark_config.py             ← Centralized SparkSession factory with MinIO S3A settings
+│   └── spark_config.py             ← Centralized SparkSession factory + performance tuning (Role 4)
 │
 ├── notebooks/
 │   ├── 01_eda.ipynb                ← Exploratory Data Analysis (Role 2)
@@ -127,12 +127,12 @@ ecommerce-demand-forecasting/
 │   │   ├── ingest.py               ← Reads raw CSV into Spark, validates schema
 │   │   └── upload_to_minio.py      ← Writes raw layer to MinIO (Bronze zone)
 │   │
-│   ├── preprocessing/              ← Role 1: Data Engineer
+│   ├── preprocessing/              ← Role 1: Data Engineer (+ partitioning, Role 4)
 │   │   ├── __init__.py
 │   │   ├── cleaner.py              ← Null handling, type casting, deduplication
 │   │   └── aggregator.py           ← Daily → Weekly aggregation (sum sales per store/item/week)
 │   │
-│   ├── feature_engineering/        ← Role 3: ML Engineer
+│   ├── feature_engineering/        ← Role 3: ML Engineer (+ Window optimization, Role 4)
 │   │   ├── __init__.py
 │   │   ├── temporal_features.py    ← week_of_year, month extraction
 │   │   ├── holiday_features.py     ← Joins US holidays CSV; creates week_has_holiday flag
@@ -144,9 +144,10 @@ ecommerce-demand-forecasting/
 │   │   ├── __init__.py
 │   │   └── analysis.py             ← Reusable Spark aggregation queries for EDA
 │   │
-│   ├── models/                     ← Role 3: ML Engineer
+│   ├── models/                     ← Role 3: ML Engineer (+ caching, Role 4)
 │   │   ├── __init__.py
 │   │   ├── base_model.py           ← Abstract base class / shared train-eval interface
+│   │   ├── train_evaluate.py       ← ML orchestration (Steps 7.2–7.5: split → train → evaluate)
 │   │   ├── linear_regression.py    ← Spark MLlib Linear Regression
 │   │   ├── random_forest.py        ← Spark MLlib Random Forest Regressor
 │   │   ├── gradient_boosting.py    ← Spark MLlib GBT Regressor
@@ -156,11 +157,6 @@ ecommerce-demand-forecasting/
 │   ├── evaluation/                 ← Role 3: ML Engineer
 │   │   ├── __init__.py
 │   │   └── metrics.py              ← RMSE, MAE, MAPE, R² computation helpers
-│   │
-│   ├── optimization/               ← Role 4: Big Data Engineer
-│   │   ├── __init__.py
-│   │   ├── partitioning.py         ← Repartition / coalesce strategies
-│   │   └── spark_tuning.py         ← Executor memory, shuffle configs, broadcast joins
 │   │
 │   └── pipeline/                   ← Role 5: MLOps Engineer
 │       ├── __init__.py
@@ -638,13 +634,17 @@ Results saved to `results/metrics/model_comparison.csv` and also uploaded to `s3
 
 ## 8. Role 4 — Big Data Engineer: Optimization & Performance
 
+> **Implementation note:** Rather than creating a separate `src/optimization/` package, all optimization decisions are applied **in-place** within the modules that use them. This avoids unnecessary wrapper code and keeps tuning configs co-located with the logic they affect.
+
 ### 8.1 Partitioning Strategy
 
-| Stage | Partition Key(s) | Rationale |
-|---|---|---|
-| Bronze (raw) | None | Single large file; no predicate pushdown needed |
-| Silver (weekly) | `store` | 10 balanced partitions; enables per-store parallel reads |
-| Gold (features) | `store`, `week_of_year` | Up to 520 partitions; enables parallel model training per store |
+Applied at write time via `.partitionBy()` in each pipeline stage:
+
+| Stage | Partition Key(s) | Implemented In | Rationale |
+|---|---|---|---|
+| Bronze (raw) | None | `src/ingestion/upload_to_minio.py` | Single large file; no predicate pushdown needed |
+| Silver (weekly) | `store` | `src/preprocessing/aggregator.py`, `cleaner.py` | 10 balanced partitions; enables per-store parallel reads |
+| Gold (features) | `store` | `src/feature_engineering/engineer.py` | 10 partitions for balanced model training reads |
 
 ### 8.2 Repartition vs Coalesce
 
@@ -658,9 +658,9 @@ df = df.coalesce(10)
 
 > Use `repartition()` when increasing partition count or requiring a full shuffle; use `coalesce()` only to reduce partition count cheaply.
 
-### 8.3 Spark Performance Tuning (`src/optimization/spark_tuning.py`)
+### 8.3 Spark Performance Tuning (`config/spark_config.py`)
 
-Configs set on the `SparkSession` in local mode:
+All performance configs are centralized in the SparkSession factory:
 
 | Config | Value | Reason |
 |---|---|---|
@@ -669,22 +669,27 @@ Configs set on the `SparkSession` in local mode:
 | `spark.sql.shuffle.partitions` | `20` | Avoids the wasteful default of 200 for this dataset size |
 | `spark.sql.autoBroadcastJoinThreshold` | `10mb` | Auto-broadcasts small dimension tables |
 | `spark.serializer` | `KryoSerializer` | Faster than Java default serializer |
+| `spark.sql.parquet.compression.codec` | `snappy` | Fast compression; reduces I/O for MinIO reads/writes |
 
-### 8.4 Window Function Optimization
+### 8.4 Window Function Optimization (`src/feature_engineering/engineer.py`)
 
-- Sort data before applying Window functions to avoid executor-side sorts
-- Cache the Silver DataFrame before feature engineering:
+- Windows use `partitionBy("store", "item").orderBy("abs_week")` — Spark only sorts within each partition, avoiding a global shuffle
+- Cache train/test DataFrames before model training to avoid recomputation (`src/models/train_evaluate.py`):
   ```python
-  df_silver.cache()
-  df_silver.count()  # trigger materialization
+  train_df.cache()
+  test_df.cache()
+  train_df.count()  # trigger materialization
+  # … train all 5 models …
+  train_df.unpersist()
+  test_df.unpersist()
   ```
 
 ### 8.5 Replication (MinIO)
 
 - MinIO configured with erasure coding for fault tolerance (equivalent to HDFS RF=3)
 - In a production HDFS setup: `dfs.replication=3`
-- For local Docker: single-node mode with volume mounts for data persistence
-- Object versioning retained for 30-day rollback
+- For local deployment: single-node mode with volume mounts for data persistence (`scripts/start_minio.sh`)
+- Object versioning supported for rollback capability
 
 ---
 
@@ -741,7 +746,7 @@ Results appended to `results/metrics/monitoring_log.csv` with timestamps.
 | 4 | Trained forecasting models (5 total) | ML Engineer | `src/models/` |
 | 5 | Model comparison metrics | ML Engineer | `results/metrics/model_comparison.csv` |
 | 6 | Model evaluation notebook | ML Engineer | `notebooks/02_model_evaluation.ipynb` |
-| 7 | Optimized Spark pipeline | Big Data Engineer | `src/optimization/` |
+| 7 | Optimized Spark pipeline | Big Data Engineer | `config/spark_config.py` + in-place across `src/` |
 | 8 | End-to-end pipeline script | MLOps Engineer | `src/pipeline/full_pipeline.py` |
 | 9 | Monitoring module | MLOps Engineer | `src/pipeline/monitor.py` |
 | 10 | Full project documentation | All | `docs/final_report.md` |

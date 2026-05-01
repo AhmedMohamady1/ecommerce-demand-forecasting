@@ -61,11 +61,9 @@ NEEDED_COLS = ["store", "item", "year", "week_of_year", "weekly_sales"]
 def _week_to_date(year: int, week: int) -> pd.Timestamp:
     """
     Convert (year, ISO week_of_year) to a Monday date (ds column for Prophet).
-    Week 1 of year Y is taken as Jan 1 + (week-1)*7 days — same approximation
-    used in the Gold feature engineer.
+    Uses ISO-consistent week start (Monday of that ISO week).
     """
-    jan1 = pd.Timestamp(year=year, month=1, day=1)
-    return jan1 + pd.Timedelta(days=(week - 1) * 7)
+    return pd.Timestamp.fromisocalendar(year, int(week), 1)
 
 
 # ── Per-pair Prophet fit/forecast ─────────────────────────────────────────────

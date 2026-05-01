@@ -14,3 +14,4 @@ pyarrow
 joblib
 streamlit
 jinja2
+config
