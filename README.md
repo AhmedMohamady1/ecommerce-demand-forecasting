@@ -178,4 +178,4 @@ The web dashboard will be available in your browser at `http://localhost:8501`.
 
 Watch the pipeline and dashboard in action:
 
-[![Demo Video](https://img.youtube.com/vi/UeTcbuYE43E/maxresdefault.jpg)](https://youtu.be/UeTcbuYE43E)
+https://github.com/user-attachments/assets/9c4ce322-5357-49b4-9caa-4d1256515bef
